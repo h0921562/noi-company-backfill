@@ -1,9 +1,10 @@
-"""GitHub Actions用: Google検索で運営会社を取得"""
-import csv, os, re, sys, time, requests, urllib.parse
+"""GitHub Actions用: HPから運営会社を取得（Google検索なし・rate limit回避）"""
+import csv, os, re, sys, time, requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+from urllib.parse import urlparse
 
-WORKERS = 3
+WORKERS = 10
 HEADERS_HTTP = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html", "Accept-Language": "ja",
@@ -26,71 +27,87 @@ def is_valid(name):
     return not any(ex in name for ex in EXCLUDE)
 
 
+def extract_company(html):
+    companies = []
+    for pat in COMPANY_PATTERNS:
+        companies.extend(re.findall(pat, html))
+    valid = [c.strip() for c in companies if is_valid(c.strip())]
+    if valid: return Counter(valid).most_common(1)[0][0]
+    return ""
+
+
 def fetch_company_hp(hp_url):
-    """HPから運営会社を取得"""
     if not hp_url: return ""
     try:
         resp = requests.get(hp_url, headers=HEADERS_HTTP, timeout=10, allow_redirects=True)
         if resp.status_code != 200: return ""
         html = resp.text
-        companies = []
-        for pat in COMPANY_PATTERNS:
-            companies.extend(re.findall(pat, html))
-        valid = [c.strip() for c in companies if is_valid(c.strip())]
-        if valid: return Counter(valid).most_common(1)[0][0]
 
-        # サブページ
-        from urllib.parse import urlparse
+        company = extract_company(html)
+        if company: return company
+
         parsed = urlparse(hp_url)
         base = f"{parsed.scheme}://{parsed.netloc}"
-        subs = set()
-        for pat in [r'href="(/[^"]*(?:company|about|corporate|info|tokusho|gaiyou)[^"]*)"',
-                    r'href="(/[^"]*(?:会社概要|運営会社|特定商取引)[^"]*)"']:
-            subs.update(re.findall(pat, html, re.IGNORECASE))
-        for sub in list(subs)[:2]:
+        sub_links = set()
+        for pat in [r'href="(/[^"]*(?:company|about|corporate|info|tokusho|legal|gaiyou|outline)[^"]*)"',
+                    r'href="(/[^"]*(?:会社概要|運営会社|特定商取引|会社情報|企業情報)[^"]*)"',
+                    r'href="(https?://[^"]*(?:company|about|corporate)[^"]*)"']:
+            sub_links.update(re.findall(pat, html, re.IGNORECASE))
+
+        for sub in list(sub_links)[:3]:
             try:
                 sub_url = base + sub if sub.startswith('/') else sub
+                if not sub_url.startswith('http'): continue
                 resp2 = requests.get(sub_url, headers=HEADERS_HTTP, timeout=8, allow_redirects=True)
                 if resp2.status_code == 200:
-                    for pat2 in COMPANY_PATTERNS:
-                        found = re.findall(pat2, resp2.text)
-                        valid2 = [c.strip() for c in found if is_valid(c.strip())]
-                        if valid2: return Counter(valid2).most_common(1)[0][0]
+                    company = extract_company(resp2.text)
+                    if company: return company
             except: continue
+
+        footer = re.search(r'(?:<footer|class="footer|id="footer)([\s\S]{0,2000}?)(?:</footer|$)', html, re.IGNORECASE)
+        if footer:
+            company = extract_company(footer.group(1))
+            if company: return company
+        copy = re.search(r'(?:copyright|©|&copy;)([\s\S]{0,300})', html, re.IGNORECASE)
+        if copy:
+            company = extract_company(copy.group(1))
+            if company: return company
     except: pass
     return ""
 
 
-def fetch_company_google(name, pref):
-    """Google検索から運営会社"""
+def fetch_company_tabelog(tabelog_url):
+    """食べログから運営会社（rate limitに注意）"""
+    if not tabelog_url: return ""
     try:
-        q = urllib.parse.quote(f'"{name}" {pref} "株式会社" OR "有限会社" OR "合同会社"')
-        resp = requests.get(f"https://www.google.com/search?q={q}&num=5",
-                            headers=HEADERS_HTTP, timeout=15)
+        resp = requests.get(tabelog_url, headers=HEADERS_HTTP, timeout=15)
         if resp.status_code == 429:
-            print("  [429] 5分待機...", flush=True)
-            time.sleep(300)
-            return fetch_company_google(name, pref)
+            time.sleep(60)
+            return ""  # リトライせず諦める
         if resp.status_code != 200: return ""
-        companies = []
-        for pat in COMPANY_PATTERNS:
-            companies.extend(re.findall(pat, resp.text))
-        valid = [c.strip() for c in companies if is_valid(c.strip())]
-        if valid: return Counter(valid).most_common(1)[0][0]
+        html = resp.text
+        for pat in [
+            r'運営会社[\s\S]{0,200}?<td[^>]*>\s*([^<]+)',
+            r'運営元[\s\S]{0,200}?<td[^>]*>\s*([^<]+)',
+        ]:
+            m = re.search(pat, html)
+            if m and is_valid(m.group(1).strip()):
+                return m.group(1).strip()
+        company = extract_company(html)
+        if company: return company
     except: pass
     return ""
 
 
 def process_row(row):
     source_file, row_idx, name, pref, tabelog_url, hp_url = row
-    # 1. HP
+    # 1. HP（rate limitなし）
     company = fetch_company_hp(hp_url)
     if company: return (*row, company, "HP")
+    # 2. 食べログ（控えめに）
+    company = fetch_company_tabelog(tabelog_url)
+    if company: return (*row, company, "tabelog")
     time.sleep(0.5)
-    # 2. Google
-    company = fetch_company_google(name, pref)
-    if company: return (*row, company, "Google")
-    time.sleep(1)
     return (*row, "", "")
 
 
@@ -98,18 +115,16 @@ def main():
     chunk_id = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     input_file = f"data/targets_{chunk_id}.csv"
     output_file = f"results/results_{chunk_id}.csv"
-    state_file = f"results/state_{chunk_id}.json"
 
     os.makedirs("results", exist_ok=True)
 
-    # 再開対応
     done_urls = set()
     if os.path.exists(output_file):
         with open(output_file, encoding="utf-8") as f:
             reader = csv.reader(f)
             next(reader, None)
             for r in reader:
-                if len(r) > 4: done_urls.add(r[4])  # tabelog_url
+                if len(r) > 4: done_urls.add(r[4])
 
     with open(input_file, encoding="utf-8") as f:
         reader = csv.reader(f)
@@ -137,11 +152,9 @@ def main():
                     result = future.result()
                     results.append(result)
                     done += 1
-                    if result[-2]:  # company found
-                        found += 1
+                    if result[-2]: found += 1
                 except: pass
 
-        # 追記
         with open(output_file, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             for r in results:
